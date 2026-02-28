@@ -65,7 +65,9 @@ def is_authority_domain(domain: str, authority_set: set) -> bool:
 
 class ExternalLinkAuditor:
     def __init__(self, start_url: str, max_pages: int, delay: float,
-                 authority_domains: set):
+                 authority_domains: set, filter_mode: str = "All Pages",
+                 filter_patterns: list = None, crawl_scope: str = "Exact Domain",
+                 custom_domains: list = None):
         parsed = urlparse(start_url)
         if not parsed.scheme:
             start_url = "https://" + start_url
@@ -77,6 +79,10 @@ class ExternalLinkAuditor:
         self.max_pages = max_pages
         self.delay = delay
         self.authority_domains = authority_domains
+        self.filter_mode = filter_mode
+        self.filter_patterns = filter_patterns or []
+        self.crawl_scope = crawl_scope
+        self.custom_domains = [d.lower().replace("www.", "") for d in (custom_domains or [])]
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -91,8 +97,32 @@ class ExternalLinkAuditor:
         self.errors = []
 
     def _is_internal(self, url: str) -> bool:
+        """Check if URL belongs to the crawl scope."""
         parsed = urlparse(url)
         domain = parsed.netloc.lower().replace("www.", "")
+
+        if self.crawl_scope == "Exact Domain":
+            # Only the exact domain (e.g., ovlg.com but NOT blog.ovlg.com)
+            return domain == self.base_domain
+
+        elif self.crawl_scope == "Include Subdomains":
+            # Main domain + all subdomains (e.g., ovlg.com, blog.ovlg.com, app.ovlg.com)
+            return domain == self.base_domain or domain.endswith("." + self.base_domain)
+
+        elif self.crawl_scope == "Subdomain Only":
+            # Only the exact subdomain entered (e.g., if user enters blog.ovlg.com,
+            # only crawl blog.ovlg.com, not ovlg.com or app.ovlg.com)
+            entered_domain = urlparse(self.start_url).netloc.lower().replace("www.", "")
+            return domain == entered_domain
+
+        elif self.crawl_scope == "Custom Domains":
+            # User-specified list of domains to treat as internal
+            all_domains = set(self.custom_domains) | {self.base_domain}
+            for allowed in all_domains:
+                if domain == allowed or domain.endswith("." + allowed):
+                    return True
+            return False
+
         return domain == self.base_domain
 
     def _normalize_url(self, url: str) -> str:
@@ -112,6 +142,20 @@ class ExternalLinkAuditor:
         parsed = urlparse(url)
         path_lower = parsed.path.lower()
         return not any(path_lower.endswith(ext) for ext in skip_extensions)
+
+    def _matches_filter(self, url: str) -> bool:
+        """Check if URL matches the filter criteria."""
+        if self.filter_mode == "All Pages" or not self.filter_patterns:
+            return True
+
+        url_lower = url.lower()
+        matches_any = any(pattern.lower() in url_lower for pattern in self.filter_patterns)
+
+        if self.filter_mode == "Include Only":
+            return matches_any
+        elif self.filter_mode == "Exclude":
+            return not matches_any
+        return True
 
     def _try_sitemap(self, progress_text):
         sitemap_urls = [
@@ -246,12 +290,15 @@ class ExternalLinkAuditor:
 
             title, internal_links, external_links = self._extract_links(html, normalized)
 
-            self.pages_data[normalized] = {
-                "title": title,
-                "external_links": external_links,
-                "external_count": len(external_links),
-            }
+            # Only record page data if it matches the filter
+            if self._matches_filter(normalized):
+                self.pages_data[normalized] = {
+                    "title": title,
+                    "external_links": external_links,
+                    "external_count": len(external_links),
+                }
 
+            # Always follow internal links for discovery regardless of filter
             for link in internal_links:
                 if link not in self.visited:
                     self.queue.append(link)
@@ -261,10 +308,17 @@ class ExternalLinkAuditor:
         total_ext = sum(p['external_count'] for p in self.pages_data.values())
         progress_bar.progress(1.0)
         progress_text.text("✅ Crawl complete!")
+
+        filter_msg = ""
+        if self.filter_mode != "All Pages" and self.filter_patterns:
+            filter_msg = f" · Filter: {self.filter_mode} ({', '.join(self.filter_patterns[:3])})"
+
         status_text.success(
             f"Crawled **{len(self.visited)}** pages · "
+            f"Audited **{len(self.pages_data)}** matching pages · "
             f"Found **{total_ext}** external links across "
             f"**{len(self.domain_summary)}** unique domains"
+            f"{filter_msg}"
         )
 
     def get_results(self):
@@ -349,41 +403,204 @@ with st.sidebar:
     st.title("🔗 External Link Auditor")
     st.markdown("---")
 
-    url_input = st.text_input(
-        "Website URL",
-        placeholder="https://www.ovlg.com",
-        help="Enter the full URL of the website to audit"
+    audit_mode = st.radio(
+        "What do you want to audit?",
+        ["🌐 Entire Domain", "🔀 Subdomain", "📄 Exact URL"],
+        help=(
+            "**Entire Domain**: Crawl all pages on a domain (e.g., ovlg.com including all subdomains). "
+            "**Subdomain**: Crawl only a specific subdomain (e.g., blog.ovlg.com). "
+            "**Exact URL**: Audit a single page instantly."
+        ),
     )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        max_pages = st.number_input("Max Pages", min_value=10, max_value=10000,
-                                value=1000, step=100)
-    with col2:
-        delay = st.number_input("Delay (sec)", min_value=0.1, max_value=5.0,
-                                 value=0.3, step=0.1)
+    # ── Exact URL Mode ─────────────────────────────────────────────────────
+    if audit_mode == "📄 Exact URL":
+        url_input = st.text_input(
+            "Page URL",
+            placeholder="https://www.ovlg.com/blog/some-long-article.html",
+            help="Paste any page URL to instantly see all its external links"
+        )
 
-    st.markdown("---")
-    st.markdown("**Authority Domains**")
-    st.caption("Domains matching these patterns are flagged as 'Authority'")
-    authority_text = st.text_area(
-        "One per line",
-        value="\n".join(DEFAULT_AUTHORITY_DOMAINS),
-        height=200,
-        label_visibility="collapsed",
-    )
-    authority_domains = set(
-        line.strip() for line in authority_text.split("\n") if line.strip()
-    )
+        st.markdown("---")
+        st.markdown("**Authority Domains**")
+        st.caption("Domains matching these patterns are flagged as 'Authority'")
+        authority_text = st.text_area(
+            "One per line",
+            value="\n".join(DEFAULT_AUTHORITY_DOMAINS),
+            height=200,
+            label_visibility="collapsed",
+            key="auth_exact",
+        )
+        authority_domains = set(
+            line.strip() for line in authority_text.split("\n") if line.strip()
+        )
 
-    st.markdown("---")
-    start_crawl = st.button("🚀 Start Audit", use_container_width=True, type="primary")
+        st.markdown("---")
+        start_crawl = st.button("🔍 Audit This Page", use_container_width=True, type="primary")
+
+        # Defaults for unused params
+        crawl_scope = "Exact Domain"
+        custom_domains = []
+        max_pages = 1
+        delay = 0.3
+        filter_mode = "All Pages"
+        filter_patterns = []
+
+    # ── Subdomain Mode ─────────────────────────────────────────────────────
+    elif audit_mode == "🔀 Subdomain":
+        url_input = st.text_input(
+            "Subdomain URL",
+            placeholder="https://blog.ovlg.com",
+            help="Enter the subdomain to crawl (e.g., blog.ovlg.com). Only pages on this exact subdomain will be audited."
+        )
+
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        with col1:
+            max_pages = st.number_input("Max Pages", min_value=10, max_value=10000,
+                                         value=1000, step=100, key="mp_sub")
+        with col2:
+            delay = st.number_input("Delay (sec)", min_value=0.1, max_value=5.0,
+                                     value=0.3, step=0.1, key="dl_sub")
+
+        st.markdown("---")
+        st.markdown("**🎯 URL Path Filter**")
+        st.caption("Optionally filter pages within this subdomain")
+
+        filter_mode = st.radio(
+            "Filter mode",
+            ["All Pages", "Include Only", "Exclude"],
+            horizontal=True,
+            help="Include Only = audit ONLY matching URLs. Exclude = skip matching URLs.",
+            key="fm_sub",
+        )
+
+        url_patterns = ""
+        if filter_mode != "All Pages":
+            url_patterns = st.text_area(
+                "URL patterns (one per line)",
+                placeholder="/blog/\n/category/",
+                help="Example: /blog/ will match all URLs containing '/blog/' in the path.",
+                height=100,
+                key="up_sub",
+            )
+        filter_patterns = []
+        if filter_mode != "All Pages" and url_patterns:
+            filter_patterns = [p.strip() for p in url_patterns.strip().split("\n") if p.strip()]
+
+        st.markdown("---")
+        st.markdown("**Authority Domains**")
+        st.caption("Domains matching these patterns are flagged as 'Authority'")
+        authority_text = st.text_area(
+            "One per line",
+            value="\n".join(DEFAULT_AUTHORITY_DOMAINS),
+            height=200,
+            label_visibility="collapsed",
+            key="auth_sub",
+        )
+        authority_domains = set(
+            line.strip() for line in authority_text.split("\n") if line.strip()
+        )
+
+        st.markdown("---")
+        start_crawl = st.button("🚀 Start Audit", use_container_width=True, type="primary", key="btn_sub")
+
+        crawl_scope = "Subdomain Only"
+        custom_domains = []
+
+    # ── Entire Domain Mode ─────────────────────────────────────────────────
+    else:
+        url_input = st.text_input(
+            "Domain",
+            placeholder="https://www.ovlg.com",
+            help="Enter the domain to crawl. All pages on this domain and its subdomains will be audited."
+        )
+
+        st.markdown("---")
+
+        include_subdomains = st.checkbox(
+            "Include subdomains (e.g., blog.ovlg.com, app.ovlg.com)",
+            value=True,
+            help="When checked, pages on subdomains are also crawled and audited."
+        )
+
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        with col1:
+            max_pages = st.number_input("Max Pages", min_value=10, max_value=10000,
+                                         value=1000, step=100, key="mp_full")
+        with col2:
+            delay = st.number_input("Delay (sec)", min_value=0.1, max_value=5.0,
+                                     value=0.3, step=0.1, key="dl_full")
+
+        st.markdown("---")
+        st.markdown("**🎯 URL Path Filter**")
+        st.caption("Optionally limit which pages get audited")
+
+        filter_mode = st.radio(
+            "Filter mode",
+            ["All Pages", "Include Only", "Exclude"],
+            horizontal=True,
+            help="Include Only = audit ONLY matching URLs. Exclude = skip matching URLs.",
+            key="fm_full",
+        )
+
+        url_patterns = ""
+        if filter_mode != "All Pages":
+            url_patterns = st.text_area(
+                "URL patterns (one per line)",
+                placeholder="/blog/\n/forum/\n/resources/",
+                help="Example: /blog/ will match all URLs containing '/blog/' in the path.",
+                height=100,
+                key="up_full",
+            )
+
+        # Quick filters
+        if filter_mode != "All Pages":
+            st.caption("Quick filters:")
+            qcol1, qcol2 = st.columns(2)
+            with qcol1:
+                if st.button("📝 Blog", use_container_width=True, key="qf_blog"):
+                    url_patterns = "/blog/"
+                if st.button("💬 Forum", use_container_width=True, key="qf_forum"):
+                    url_patterns = "/forum/\n/community/\n/discuss/"
+            with qcol2:
+                if st.button("📄 Services", use_container_width=True, key="qf_services"):
+                    url_patterns = "/debt-settlement/\n/bankruptcy/\n/debt-consolidation/"
+                if st.button("❓ Q&A", use_container_width=True, key="qf_qa"):
+                    url_patterns = "/questions/\n/answers/\n/ask/"
+
+        filter_patterns = []
+        if filter_mode != "All Pages" and url_patterns:
+            filter_patterns = [p.strip() for p in url_patterns.strip().split("\n") if p.strip()]
+
+        st.markdown("---")
+        st.markdown("**Authority Domains**")
+        st.caption("Domains matching these patterns are flagged as 'Authority'")
+        authority_text = st.text_area(
+            "One per line",
+            value="\n".join(DEFAULT_AUTHORITY_DOMAINS),
+            height=200,
+            label_visibility="collapsed",
+            key="auth_full",
+        )
+        authority_domains = set(
+            line.strip() for line in authority_text.split("\n") if line.strip()
+        )
+
+        st.markdown("---")
+        start_crawl = st.button("🚀 Start Audit", use_container_width=True, type="primary", key="btn_full")
+
+        crawl_scope = "Include Subdomains" if include_subdomains else "Exact Domain"
+        custom_domains = []
 
 
 # ─── Main Area ────────────────────────────────────────────────────────────────
 
 if "results" not in st.session_state:
     st.session_state.results = None
+if "single_page_result" not in st.session_state:
+    st.session_state.single_page_result = None
 
 if start_crawl and url_input:
     # Clean up URL
@@ -392,23 +609,144 @@ if start_crawl and url_input:
         url = "https://" + url
 
     st.session_state.results = None
+    st.session_state.single_page_result = None
 
-    progress_bar = st.progress(0)
-    progress_text = st.empty()
-    status_text = st.empty()
+    if audit_mode == "📄 Exact URL":
+        # ── Single Page Audit ──────────────────────────────────────────────
+        with st.spinner(f"Fetching {url}..."):
+            try:
+                session = requests.Session()
+                session.headers.update({
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml",
+                })
+                resp = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+                content_type = resp.headers.get("content-type", "")
 
-    auditor = ExternalLinkAuditor(url, max_pages, delay, authority_domains)
-    auditor.crawl(progress_bar, progress_text, status_text)
-    st.session_state.results = auditor.get_results()
-    st.rerun()
+                if "text/html" not in content_type:
+                    st.error("This URL did not return an HTML page.")
+                else:
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    title_tag = soup.find("title")
+                    title = title_tag.get_text(strip=True) if title_tag else url
+
+                    external_links = []
+                    seen = set()
+                    page_domain = urlparse(url).netloc.lower().replace("www.", "")
+
+                    for a_tag in soup.find_all("a", href=True):
+                        href = a_tag["href"].strip()
+                        if href.startswith(("#", "mailto:", "tel:", "javascript:")):
+                            continue
+                        full_url = urljoin(url, href)
+                        parsed = urlparse(full_url)
+                        if parsed.scheme not in ("http", "https"):
+                            continue
+                        link_domain = parsed.netloc.lower().replace("www.", "")
+                        if link_domain != page_domain and full_url not in seen:
+                            seen.add(full_url)
+                            anchor_text = a_tag.get_text(strip=True) or "[no anchor text]"
+                            rel_attrs = a_tag.get("rel", [])
+                            external_links.append({
+                                "url": full_url,
+                                "domain": link_domain,
+                                "anchor": anchor_text[:200],
+                                "is_authority": is_authority_domain(link_domain, authority_domains),
+                                "rel": ", ".join(rel_attrs) if rel_attrs else "",
+                            })
+
+                    st.session_state.single_page_result = {
+                        "url": url,
+                        "title": title,
+                        "external_links": external_links,
+                        "total": len(external_links),
+                    }
+                    st.rerun()
+
+            except Exception as e:
+                st.error(f"Failed to fetch page: {e}")
+
+    else:
+        # ── Full Site Crawl ────────────────────────────────────────────────
+        progress_bar = st.progress(0)
+        progress_text = st.empty()
+        status_text = st.empty()
+
+        auditor = ExternalLinkAuditor(url, max_pages, delay, authority_domains,
+                                          filter_mode, filter_patterns, crawl_scope,
+                                          custom_domains)
+        auditor.crawl(progress_bar, progress_text, status_text)
+        st.session_state.results = auditor.get_results()
+        st.rerun()
 
 elif start_crawl and not url_input:
-    st.warning("Please enter a website URL in the sidebar.")
+    st.warning("Please enter a URL in the sidebar.")
+
+
+# ─── Single Page Results ──────────────────────────────────────────────────────
+
+if st.session_state.get("single_page_result"):
+    data = st.session_state.single_page_result
+    auth_count = sum(1 for l in data["external_links"] if l["is_authority"])
+    non_auth_count = data["total"] - auth_count
+
+    st.markdown(f"### 📄 Single Page Audit")
+    st.markdown(f"**{data['title']}**")
+    st.caption(f"{data['url']}")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total External Links", data["total"])
+    c2.metric("Non-Authority", non_auth_count)
+    c3.metric("Authority", auth_count)
+
+    st.markdown("---")
+
+    # Search & filter
+    search_single = st.text_input("Search links", placeholder="Filter by URL, domain, or anchor text...",
+                                   key="search_single")
+    scol1, scol2 = st.columns(2)
+    with scol1:
+        type_filter = st.radio("Show", ["All", "Non-Authority Only", "Authority Only"],
+                                horizontal=True, key="single_type_filter")
+
+    links = data["external_links"]
+    if search_single:
+        q = search_single.lower()
+        links = [l for l in links if q in l["url"].lower() or q in l["domain"].lower()
+                 or q in l["anchor"].lower()]
+    if type_filter == "Non-Authority Only":
+        links = [l for l in links if not l["is_authority"]]
+    elif type_filter == "Authority Only":
+        links = [l for l in links if l["is_authority"]]
+
+    # CSV download
+    csv_rows = [(l["url"], l["domain"], l["anchor"],
+                  "Authority" if l["is_authority"] else "Non-Authority", l["rel"])
+                 for l in links]
+    csv_str, fname = make_csv_download(csv_rows,
+        ["External URL", "Domain", "Anchor Text", "Type", "Rel"],
+        f"single-page-audit.csv")
+    st.download_button("📥 Download CSV", csv_str, fname, "text/csv", key="dl_single")
+
+    st.caption(f"Showing {len(links)} links")
+
+    if links:
+        import pandas as pd
+        df = pd.DataFrame(links)
+        df = df[["url", "domain", "anchor", "is_authority", "rel"]]
+        df.columns = ["External URL", "Domain", "Anchor Text", "Authority", "Rel"]
+        df["Authority"] = df["Authority"].map({True: "✅ Authority", False: "⚠️ Non-Authority"})
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No external links found matching your filters.")
 
 
 # ─── Display Results ──────────────────────────────────────────────────────────
 
-if st.session_state.results:
+if st.session_state.get("single_page_result"):
+    pass  # Already displayed above
+
+elif st.session_state.results:
     data = st.session_state.results
 
     # Stats row
@@ -573,23 +911,22 @@ else:
     st.markdown("""
     # 🔗 External Link Auditor
 
-    Crawl your website and audit every external link — find unnecessary outbound links
+    Audit any website's external links — find unnecessary outbound links
     and identify opportunities to replace them with authoritative (.gov, .edu) sources.
 
-    ### How it works
+    ### Three ways to audit
 
-    1. Enter your domain in the sidebar
-    2. Click **Start Audit**
-    3. The tool crawls your site via sitemap + internal links
-    4. Review results across three views: Pages, Domains, All Links
-    5. Export CSV for your content team
+    - **🌐 Entire Domain** — Crawl all pages on a domain (with or without subdomains)
+    - **🔀 Subdomain** — Crawl only a specific subdomain (e.g., `blog.ovlg.com`)
+    - **📄 Exact URL** — Paste any single page URL and instantly see all its external links
 
-    ### Views
+    ### What you get
 
-    - **Pages View** — Every page ranked by external link count. Expand to see details.
-    - **Domains View** — All external domains ranked by frequency. Filter non-authority domains.
-    - **All Links View** — Flat searchable list of every external link.
+    - Every external link on every page, with domain, anchor text, and rel attributes
+    - Links classified as **Authority** (.gov, .edu, CFPB, FTC, etc.) or **Non-Authority**
+    - Search, filter, sort across all results
+    - **CSV export** for your content team
 
     ---
-    *Configure max pages, crawl delay, and authority domains in the sidebar.*
+    *Select your audit type and enter a URL in the sidebar to get started.*
     """)
