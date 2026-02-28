@@ -358,7 +358,7 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     with col1:
         max_pages = st.number_input("Max Pages", min_value=10, max_value=10000,
-                                     value=500, step=50)
+                                value=1000, step=100)
     with col2:
         delay = st.number_input("Delay (sec)", min_value=0.1, max_value=5.0,
                                  value=0.3, step=0.1)
